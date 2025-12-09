@@ -1,0 +1,5 @@
+{
+  "name": "DevOps QuizMaster",
+  "description": "A dynamic, AI-powered quiz application designed for testing knowledge in CI/CD pipelines. Features AI quiz generation, interactive testing, and performance analytics with persistent history.",
+  "requestFramePermissions": []
+}
