@@ -2,8 +2,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: devops-quizmaster-deployment
+  labels:
+    app: devops-quizmaster
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: devops-quizmaster
@@ -14,18 +16,7 @@ spec:
     spec:
       containers:
       - name: app
-        image: __IMAGE_PLACEHOLDER__
+        image: __IMAGE_PLACEHOLDER__    # Jenkins will replace this
+        imagePullPolicy: Always
         ports:
         - containerPort: 80
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: devops-quizmaster-svc
-spec:
-  type: LoadBalancer
-  selector:
-    app: devops-quizmaster
-  ports:
-  - port: 80
-    targetPort: 80
