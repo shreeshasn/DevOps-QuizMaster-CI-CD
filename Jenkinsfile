@@ -1,10 +1,9 @@
-// Jenkinsfile - Multibranch friendly, Windows + Unix compatible
+// Jenkinsfile - windows + unix friendly, kube deploy PowerShell escaping fixed
 pipeline {
-  agent { label 'master' } // or leave default node if you want
+  agent { label 'master' }
   environment {
-    // set defaults; IMAGE_TAG will be computed at runtime
     DOCKER_REPO = "shreeshasn/devops-quizmaster"
-    KUBE_DEPLOY = "true"           // set to "false" if you don't want automatic k8s deploy
+    KUBE_DEPLOY = "true"
     NOTIFY_MSG = "CI: build finished for ${env.BRANCH_NAME}"
   }
   options {
@@ -15,24 +14,18 @@ pipeline {
 
   stages {
     stage('Declarative: Checkout SCM') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Prepare') {
       steps {
         script {
-          // record short git sha to .gitsha (works on Windows & Unix)
           if (isUnix()) {
             sh "git rev-parse --short HEAD > .gitsha"
           } else {
             bat 'git rev-parse --short HEAD 1>.gitsha'
           }
-          // load it to a variable
           env.GIT_SHORT = readFile('.gitsha').trim()
-          env.IMAGE_TAG = "${DOCKER_REPO}: ${env.GIT_SHORT}".replaceAll('\\s','') // ensure no spaces
-          // better IMAGE_TAG: shreeshasn/devops-quizmaster:main-<sha>
           env.IMAGE_TAG = "${DOCKER_REPO}:${env.BRANCH_NAME}-${env.GIT_SHORT}"
         }
       }
@@ -40,7 +33,6 @@ pipeline {
 
     stage('Install') {
       steps {
-        // if you keep API keys in Jenkins credentials, inject here
         withCredentials([string(credentialsId: 'quiz-api-key', variable: 'QUIZ_API_KEY')]) {
           script {
             if (isUnix()) {
@@ -50,7 +42,6 @@ pipeline {
                 npm ci
               '''
             } else {
-              // Windows agent
               bat """
 powershell -NoProfile -Command ^
   Set-Content -Path .env.local -Value "VITE_API_KEY=${env.QUIZ_API_KEY}" -Force; ^
@@ -66,11 +57,8 @@ powershell -NoProfile -Command ^
     stage('Build') {
       steps {
         script {
-          if (isUnix()) {
-            sh 'npm run build'
-          } else {
-            bat 'npm run build'
-          }
+          if (isUnix()) { sh 'npm run build' }
+          else { bat 'npm run build' }
         }
       }
     }
@@ -81,7 +69,6 @@ powershell -NoProfile -Command ^
           if (isUnix()) {
             sh "docker build -t ${env.IMAGE_TAG} ."
           } else {
-            // For Windows local Docker Desktop; allow switching DOCKER_HOST if needed
             bat """
 set DOCKER_HOST=tcp://127.0.0.1:2375
 docker build -t ${env.IMAGE_TAG} .
@@ -128,7 +115,6 @@ docker logout || echo logout-failed
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF')]) {
           script {
             if (isUnix()) {
-              // Unix-friendly (bash/sh)
               sh """
 export KUBECONFIG="$KUBECONF"
 if kubectl get deployment devops-quizmaster-deployment >/dev/null 2>&1; then
@@ -140,12 +126,12 @@ else
 fi
 """
             } else {
-              // Windows PowerShell safe version
+              // PowerShell block: escape PowerShell $ so Groovy doesn't interpolate them
               bat """
 powershell -NoProfile -Command ^
   \$Env:KUBECONFIG = "${env.KUBECONF}"; ^
   \$img = "${env.IMAGE_TAG}"; ^
-  if (kubectl get deployment devops-quizmaster-deployment -o name 2>$null) { ^
+  if (kubectl get deployment devops-quizmaster-deployment -o name 2>\$null) { ^
     kubectl set image deployment/devops-quizmaster-deployment app=\$img --record; ^
     kubectl rollout status deployment/devops-quizmaster-deployment --timeout=120s; ^
   } else { ^
@@ -154,16 +140,15 @@ powershell -NoProfile -Command ^
   }
 """
             }
-          } // script
-        } // withCredentials
-      } // steps
-    } // stage
+          }
+        }
+      }
+    }
 
   } // stages
 
   post {
     always {
-      // Slack + cleanup actions
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         script {
           def msg = "${currentBuild.currentResult}: ${env.JOB_NAME} [${env.BRANCH_NAME}] #${env.BUILD_NUMBER} - ${env.IMAGE_TAG}"
@@ -183,13 +168,7 @@ powershell -NoProfile -Command ^
         }
       }
     }
-
-    success {
-      echo "Build succeeded: ${env.IMAGE_TAG}"
-    }
-
-    failure {
-      echo "Build failed"
-    }
-  } // post
+    success { echo "Build succeeded: ${env.IMAGE_TAG}" }
+    failure { echo "Build failed" }
+  }
 }
