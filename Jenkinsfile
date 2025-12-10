@@ -1,7 +1,7 @@
 pipeline {
   agent any
   environment {
-    IMAGE_BASE = "YOUR_DOCKERHUB_USER/devops-quizmaster" // replace this
+    IMAGE_BASE = "shreeshasn/devops-quizmaster" // replace this
   }
   options { timeout(time:30, unit:'MINUTES') }
   stages {
