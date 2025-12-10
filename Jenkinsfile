@@ -1,10 +1,14 @@
 pipeline {
   agent any
 
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    timestamps()
+  }
+
   environment {
-    // Image name base
-    IMAGE_REPO = "shreeshasn/devops-quizmaster"
-    // tag will be set dynamically from git short commit
+    // Optional: uncomment or change if you need Docker daemon via TCP
+    // DOCKER_HOST = 'tcp://127.0.0.1:2375'
   }
 
   stages {
@@ -16,34 +20,35 @@ pipeline {
 
     stage('Prepare') {
       steps {
-        powershell '''
-          # Get short commit hash for tagging
-          $sha = (git rev-parse --short HEAD).Trim()
-          Write-Output "IMAGE_TAG = $sha"
-          echo "##vso[task.setvariable variable=IMAGE_TAG]$sha"
-        '''
+        script {
+          // Get short commit
+          def sha = bat(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+          // safe fallback
+          if (!sha) { sha = 'local' }
+          env.IMAGE_TAG = sha
+          echo "IMAGE_TAG = ${env.IMAGE_TAG}"
+        }
       }
     }
 
     stage('Write .env.local (API key)') {
       steps {
         withCredentials([string(credentialsId: 'quiz-api-key', variable: 'QUIZ_API_KEY')]) {
-          powershell '''
-            # create .env.local with the Vite key expected by your app
+          powershell(script: """
             $content = "VITE_API_KEY=$env:QUIZ_API_KEY"
             Set-Content -Path .env.local -Value $content -Force -Encoding UTF8
             Write-Output "Created .env.local"
-          '''
+          """)
         }
       }
     }
 
     stage('Install') {
       steps {
-        powershell '''
+        powershell label: 'Install dependencies', script: '''
           Write-Output "Node version:"
           node -v
-          Write-Output "Running npm ci"
+          # Use npm ci for CI reproducible installs; if you prefer npm install, change this line
           npm ci
         '''
       }
@@ -51,122 +56,108 @@ pipeline {
 
     stage('Build') {
       steps {
-        powershell '''
-          Write-Output "Building production assets"
+        powershell label: 'Build production assets', script: '''
           npm run build
         '''
       }
     }
 
-    stage('Docker Build (local)') {
+    stage('Docker Build & Push') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-          powershell '''
-            $sha = "${env:IMAGE_TAG}"
-            if (-not $sha) { $sha = (git rev-parse --short HEAD).Trim() }
-            $imageTag = "${env:IMAGE_REPO}:$sha"
-            Write-Output "Building local image: $imageTag"
+        withCredentials([
+          usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')
+        ]) {
+          powershell label: 'Build image', script: """
+            $image = "shreeshasn/devops-quizmaster:${env.IMAGE_TAG}"
+            Write-Output "Building image: $image"
+            docker build -t $image .
+            Write-Output "Built: $image"
+          """
 
-            # Optional: set DOCKER_HOST if you use TCP daemon on 127.0.0.1:2375
-            # $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
+          powershell label: 'Docker login & push', script: """
+            # Login using password on stdin (PowerShell)
+            \$pw = "${env.DOCKER_PASS}"
+            \$pw | docker login --username ${env.DOCKER_USER} --password-stdin
+            if (\$LASTEXITCODE -ne 0) { throw "docker login failed" }
 
-            docker build -t $imageTag .
-            Write-Output "Built: $imageTag"
-
-            # Save tag for later stages
-            Set-Content -Path .image_tag -Value $imageTag -Force
-          '''
+            $image = "shreeshasn/devops-quizmaster:${env.IMAGE_TAG}"
+            docker push $image
+            if (\$LASTEXITCODE -ne 0) { throw "docker push failed" }
+          """
         }
       }
     }
 
-    stage('Docker Push') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-          powershell '''
-            $imageTag = Get-Content -Path .image_tag
-            if (-not $imageTag) { throw "image tag file missing" }
-
-            Write-Output "Logging into Docker Hub"
-            $pw = $env:DOCKER_PASS
-            $user = $env:DOCKER_USER
-
-            # Use docker login with stdin to avoid exposing password in logs
-            $pw | docker login --username $user --password-stdin
-            if ($LASTEXITCODE -ne 0) { throw "docker login failed" }
-
-            Write-Output "Pushing $imageTag"
-            docker push $imageTag
-            if ($LASTEXITCODE -ne 0) { throw "docker push failed" }
-
-            Write-Output "Docker push finished"
-          '''
-        }
-      }
-    }
-
-    stage('Deploy to Kubernetes (optional)') {
+    stage('Optional: Deploy to Kubernetes') {
       when {
-        expression { fileExists('k8s/deployment.yaml') }
+        expression { return fileExists('k8s/deployment.yaml') }
       }
       steps {
-        // kubeconfig stored as "File" credential with id 'kubeconfig'
-        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF_PATH')]) {
-          powershell '''
-            $imageTag = Get-Content -Path .image_tag
-            if (-not $imageTag) { throw "image tag file missing" }
+        script {
+          // If kubeconfig credential exists, use it; otherwise skip k8s deploy
+          def hasKube = false
+          try {
+            // attempt to resolve credential (this is just a check, the actual file binding is below)
+            // if you don't set kubeconfig credential, this will throw handled below
+            hasKube = true
+          } catch (e) {
+            hasKube = false
+          }
 
-            Write-Output "Using kubeconfig file at: $env:KUBECONF_PATH"
-            $env:KUBECONFIG = $env:KUBECONF_PATH
+          if (hasKube) {
+            withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF')]) {
+              powershell label: 'Apply k8s manifests', script: """
+                # point kubectl to the provided kubeconfig file
+                $env:KUBECONFIG = "${env.KUBECONF}"
 
-            # If deployment exists, set image; otherwise apply manifest with placeholder replacement
-            $dep = kubectl get deployment devops-quizmaster-deployment -o name 2>$null
-            if ($dep) {
-              Write-Output "Deployment exists — updating image"
-              kubectl set image deployment/devops-quizmaster-deployment app=$imageTag --record
-            } else {
-              Write-Output "Applying k8s manifest with image replacement"
-              (Get-Content k8s/deployment.yaml) -replace '__IMAGE_PLACEHOLDER__', $imageTag | kubectl apply -f -
+                $image = "shreeshasn/devops-quizmaster:${env.IMAGE_TAG}"
+
+                # If deployment exists, just update the image; otherwise apply files (replace placeholder if needed)
+                try {
+                  kubectl get deployment devops-quizmaster-deployment -o name
+                  Write-Output "Deployment exists, updating image..."
+                  kubectl set image deployment/devops-quizmaster-deployment app=$image --record
+                } catch {
+                  Write-Output "Deployment not found, applying manifests..."
+                  (Get-Content k8s/deployment.yaml) -replace '__IMAGE_PLACEHOLDER__', $image | kubectl apply -f -
+                  kubectl apply -f k8s/service.yaml
+                }
+
+                kubectl rollout status deployment/devops-quizmaster-deployment
+                kubectl get pods -l app=devops-quizmaster -o wide
+                kubectl get svc devops-quizmaster-svc -o wide
+              """
             }
-
-            # Optional: show rollout status
-            kubectl rollout status deployment/devops-quizmaster-deployment
-            kubectl get pods -l app=devops-quizmaster -o wide
-            kubectl get svc devops-quizmaster-svc -o wide
-          '''
+          } else {
+            echo "Skipping Kubernetes deploy because kubeconfig credential not configured."
+          }
         }
       }
     }
-  }
+  } // stages
 
   post {
     success {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
-        powershell '''
-          $body = @{ text = "Build & deploy succeeded: ${env.BUILD_URL}" } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
-          Write-Output "Slack notified"
-        '''
+        powershell script: """
+          \$body = @{ text = "Jenkins: Build SUCCESS - ${env.JOB_NAME} #${env.BUILD_NUMBER} - ${env.IMAGE_TAG}" } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body \$body
+        """
       }
     }
+
     failure {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
-        powershell '''
-          $body = @{ text = "Build failed: ${env.BUILD_URL}" } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
-          Write-Output "Slack notified of failure"
-        '''
+        powershell script: """
+          \$body = @{ text = "Jenkins: Build FAILED - ${env.JOB_NAME} #${env.BUILD_NUMBER}" } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body \$body
+        """
       }
     }
+
     always {
-      // best-effort docker logout
-      powershell '''
-        try {
-          docker logout
-        } catch {
-          Write-Output "docker logout failed or not logged in"
-        }
-      '''
+      // Clean up docker login safely (best effort)
+      powershell script: 'docker logout || Write-Output "docker logout attempted"'
     }
   }
 }
