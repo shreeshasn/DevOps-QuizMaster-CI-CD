@@ -2,8 +2,10 @@ pipeline {
   agent any
 
   environment {
-    IMAGE_BASE = "shreeshasn/devops-quizmaster"    // <--- change if your DockerHub repo is different
-    DOCKER_HOST = "tcp://127.0.0.1:2375"        // forces docker CLI to use TCP on Windows
+    IMAGE_BASE = "shreeshasn/devops-quizmaster"    // change if needed
+    DOCKER_HOST = "tcp://127.0.0.1:2375"           // for Windows docker CLI connectivity
+    // deploy only from main
+    KUBE_DEPLOY = "${env.BRANCH_NAME == 'main' ? 'true' : 'false'}"
   }
 
   options {
@@ -27,13 +29,28 @@ pipeline {
 
     stage('Install') {
       steps {
-        script {
-          if (isUnix()) {
-            sh 'node -v || true'
-            sh 'npm ci'
-          } else {
-            bat 'node -v || echo "node not found"'
-            bat 'npm ci'
+        // create .env.local from Jenkins secret before building
+        withCredentials([string(credentialsId: 'QUIZ_API_KEY', variable: 'QUIZ_API_KEY')]) {
+          script {
+            if (isUnix()) {
+              // write .env.local
+              sh '''
+                cat > .env.local <<'EOF'
+                VITE_API_KEY=${QUIZ_API_KEY}
+                EOF
+              '''
+              sh 'node -v || true'
+              sh 'npm ci'
+            } else {
+              // Windows: create .env.local using PowerShell, then install
+              bat """
+                powershell -NoProfile -Command ^
+                  \$key = [System.Environment]::GetEnvironmentVariable('QUIZ_API_KEY'); ^
+                  Set-Content -Path .env.local -Value \"VITE_API_KEY=\$key\" -Force
+              """
+              bat 'node -v || echo "node not found"'
+              bat 'npm ci'
+            }
           }
         }
       }
@@ -61,7 +78,6 @@ pipeline {
           if (isUnix()) {
             sh "docker build -t ${env.IMAGE_TAG} ."
           } else {
-            // ensure docker uses TCP socket on Windows
             bat "set DOCKER_HOST=${DOCKER_HOST} && docker build -t ${env.IMAGE_TAG} ."
           }
         }
@@ -124,10 +140,8 @@ pipeline {
           def msg = "✅ ${env.JOB_NAME} [${env.BRANCH_NAME ?: 'local'}] build #${env.BUILD_NUMBER} succeeded — ${env.IMAGE_TAG}"
           env.NOTIFY_MSG = msg
           if (isUnix()) {
-            // escape double quotes in message
             sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${env.SLACK_WEBHOOK} || true"
           } else {
-            // read message from environment in PowerShell to avoid complex quoting
             bat """
               powershell -NoProfile -Command ^
                 \$body = @{ text = [System.Environment]::GetEnvironmentVariable('NOTIFY_MSG') }; ^
