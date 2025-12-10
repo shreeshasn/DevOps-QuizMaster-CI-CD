@@ -1,5 +1,5 @@
 pipeline {
-  agent { label any }
+  agent any
   options {
     timestamps()
     // no ansiColor because that caused issues in your Jenkins before
