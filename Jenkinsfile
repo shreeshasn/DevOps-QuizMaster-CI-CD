@@ -1,10 +1,9 @@
-// Jenkinsfile - Windows-only, PowerShell steps, minimal
+// Jenkinsfile - simple Windows-friendly, agent:any
 pipeline {
-  agent { label 'windows' }
+  agent any
 
   environment {
     DOCKER_REPO = "shreeshasn/devops-quizmaster"
-    // CI will set IMAGE_TAG after checkout
   }
 
   options {
@@ -23,21 +22,20 @@ pipeline {
     stage('Prepare') {
       steps {
         powershell '''
-# write short git sha to file and read it
+# short git sha into file and set IMAGE_TAG
 git rev-parse --short HEAD > .gitsha
 $git = Get-Content .gitsha -Raw
-$env:IMAGE_TAG = "${env:DOCKER_REPO}:${env.BRANCH_NAME}-$git".Trim()
+$env:IMAGE_TAG = "${DOCKER_REPO}:${BRANCH_NAME}-$git".Trim()
 Write-Host "IMAGE_TAG = $env:IMAGE_TAG"
 '''
       }
     }
 
-    stage('Install: set API key & npm ci') {
+    stage('Set API key & Install') {
       steps {
-        // credential id 'quiz-api-key' must exist (Secret text)
+        // create secret text credential in Jenkins with id 'quiz-api-key'
         withCredentials([string(credentialsId: 'quiz-api-key', variable: 'QUIZ_API_KEY')]) {
           powershell '''
-# create .env.local for Vite with API key
 Set-Content -Path .env.local -Value ("VITE_API_KEY={0}" -f $env:QUIZ_API_KEY) -Force
 Write-Host ".env.local created"
 npm --version
@@ -49,38 +47,30 @@ npm ci
 
     stage('Build') {
       steps {
-        powershell '''
-npm run build
-'''
+        powershell 'npm run build'
       }
     }
 
-    stage('Docker: build') {
+    stage('Docker Build') {
       steps {
         powershell '''
-# If using Docker Desktop with remote API on 127.0.0.1:2375 set DOCKER_HOST; otherwise ensure Docker daemon accessible
-setx DOCKER_HOST "tcp://127.0.0.1:2375" > $null 2>&1 || Write-Host "setx may require restart - continuing"
+# If Docker daemon requires DOCKER_HOST on this agent, set it here (optional)
+# setx DOCKER_HOST "tcp://127.0.0.1:2375" > $null 2>&1 || Write-Host "setx may require restart - continuing"
 docker build -t $env:IMAGE_TAG .
 docker images --filter=reference=$env:IMAGE_TAG
 '''
       }
     }
 
-    stage('Docker: push') {
+    stage('Docker Push') {
       steps {
-        // dockerhub username/password as credentials (update IDs in Jenkins)
-        withCredentials([
-          string(credentialsId: 'dockerhub-username', variable: 'DOCKER_USER'),
-          string(credentialsId: 'dockerhub-password', variable: 'DOCKER_PASS')
-        ]) {
+        // Create a Jenkins credential of type "Username with password" id 'dockerhub-creds'
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
           powershell '''
-# Login and push
+# login and push
 $pw = $env:DOCKER_PASS
-# echo password to docker login (PowerShell)
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($pw + "`n")
-$ms = New-Object System.IO.MemoryStream(,$bytes)
-# Use plain docker login if available; fallback to echo
-echo $pw | docker login -u $env:DOCKER_USER --password-stdin
+# Use docker login via stdin
+$pw | docker login -u $env:DOCKER_USER --password-stdin
 docker push $env:IMAGE_TAG
 docker logout || Write-Host "docker logout failed but continuing"
 '''
@@ -88,23 +78,23 @@ docker logout || Write-Host "docker logout failed but continuing"
       }
     }
 
-    stage('Optional: Deploy to K8s (if kubeconfig credential exists)') {
+    stage('Optional: Deploy to Kubernetes') {
       when {
-        expression { return fileExists('k8s/deployment.yaml') }
+        expression { fileExists('k8s/deployment.yaml') }
       }
       steps {
-        // 'kubeconfig' is stored in Jenkins as a secret file credential
+        // add a Jenkins secret file credential named 'kubeconfig' (content = your kubeconfig)
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF')]) {
           powershell '''
-# point kubectl to provided kubeconfig
 $env:KUBECONFIG = "${env:KUBECONF}"
 $img = $env:IMAGE_TAG
 
-# If deployment exists, update image; else apply manifest with replacement
 if (kubectl get deployment devops-quizmaster-deployment -o name 2>$null) {
+  Write-Host "Updating image on existing deployment..."
   kubectl set image deployment/devops-quizmaster-deployment app=$img --record
   kubectl rollout status deployment/devops-quizmaster-deployment --timeout=120s
 } else {
+  Write-Host "Applying manifest with image replacement..."
   (Get-Content .\\k8s\\deployment.yaml) -replace '__IMAGE_PLACEHOLDER__', $img | kubectl apply -f -
   kubectl rollout status deployment/devops-quizmaster-deployment --timeout=120s
 }
@@ -112,13 +102,15 @@ if (kubectl get deployment devops-quizmaster-deployment -o name 2>$null) {
         }
       }
     }
-  } // stages
 
-  post {
-    always {
-      // slack-webhook as secret text
-      withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
-        powershell '''
+    stage('Notify (Slack)') {
+      when {
+        expression { return env.BUILD_ID != null } // runs only when an agent/executor was available
+      }
+      steps {
+        // create a Jenkins secret text credential 'slack-webhook' with the webhook URL
+        withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
+          powershell '''
 $result = "${currentBuild.currentResult}: ${env.JOB_NAME} [${env.BRANCH_NAME}] #${env.BUILD_NUMBER} -> ${env:IMAGE_TAG}"
 $body = @{ text = $result } | ConvertTo-Json
 try {
@@ -128,9 +120,14 @@ try {
   Write-Host "Slack notify failed: $_"
 }
 '''
+        }
       }
     }
-    success { echo "SUCCESS: image ${env.IMAGE_TAG}" }
+  } // stages
+
+  post {
+    success { echo "SUCCESS: ${env.IMAGE_TAG}" }
     failure { echo "FAILED" }
+    always { echo "Pipeline finished: ${currentBuild.currentResult}" }
   }
 }
