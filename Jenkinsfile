@@ -2,10 +2,8 @@ pipeline {
   agent any
 
   environment {
-    // Replace with your Docker Hub repo
-    IMAGE_BASE = "shreeshasn/devops-quizmaster"
-    // Force docker client to use TCP loopback (safe for local dev)
-    DOCKER_HOST = "tcp://127.0.0.1:2375"
+    IMAGE_BASE = "shreeshasn/devops-quizmaster"    // <--- change if your DockerHub repo is different
+    DOCKER_HOST = "tcp://127.0.0.1:2375"        // forces docker CLI to use TCP on Windows
   }
 
   options {
@@ -31,7 +29,8 @@ pipeline {
       steps {
         script {
           if (isUnix()) {
-            sh 'node -v || true; npm ci'
+            sh 'node -v || true'
+            sh 'npm ci'
           } else {
             bat 'node -v || echo "node not found"'
             bat 'npm ci'
@@ -56,13 +55,13 @@ pipeline {
       steps {
         script {
           def sha = readFile('.gitsha').trim()
-          def safeBranch = env.BRANCH_NAME.replaceAll('/', '-')
+          def safeBranch = env.BRANCH_NAME ? env.BRANCH_NAME.replaceAll('/', '-') : 'local'
           env.IMAGE_TAG = "${IMAGE_BASE}:${safeBranch}-${sha}"
 
           if (isUnix()) {
             sh "docker build -t ${env.IMAGE_TAG} ."
           } else {
-            // ensure DOCKER_HOST env var is used by the docker CLI on Windows
+            // ensure docker uses TCP socket on Windows
             bat "set DOCKER_HOST=${DOCKER_HOST} && docker build -t ${env.IMAGE_TAG} ."
           }
         }
@@ -77,7 +76,6 @@ pipeline {
               sh 'echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USER" --password-stdin'
               sh "docker push ${env.IMAGE_TAG}"
             } else {
-              // Use cmd to pipe password to docker login and push
               bat "set DOCKER_HOST=${DOCKER_HOST} && echo %DOCKERHUB_PASS% | docker login -u %DOCKERHUB_USER% --password-stdin"
               bat "set DOCKER_HOST=${DOCKER_HOST} && docker push ${env.IMAGE_TAG}"
             }
@@ -123,27 +121,41 @@ pipeline {
     success {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         script {
-          def msg = "✅ ${env.JOB_NAME} [${env.BRANCH_NAME}] build #${env.BUILD_NUMBER} succeeded — ${env.IMAGE_TAG}"
+          def msg = "✅ ${env.JOB_NAME} [${env.BRANCH_NAME ?: 'local'}] build #${env.BUILD_NUMBER} succeeded — ${env.IMAGE_TAG}"
+          env.NOTIFY_MSG = msg
           if (isUnix()) {
-            sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${SLACK_WEBHOOK} || true"
+            // escape double quotes in message
+            sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${env.SLACK_WEBHOOK} || true"
           } else {
-            bat "powershell -NoProfile -Command \"Invoke-RestMethod -Uri '${SLACK_WEBHOOK}' -Method Post -ContentType 'application/json' -Body (ConvertTo-Json @{text='${msg.replaceAll(\"'\",\"`'")} })\""
+            // read message from environment in PowerShell to avoid complex quoting
+            bat """
+              powershell -NoProfile -Command ^
+                \$body = @{ text = [System.Environment]::GetEnvironmentVariable('NOTIFY_MSG') }; ^
+                Invoke-RestMethod -Uri '${env.SLACK_WEBHOOK}' -Method Post -ContentType 'application/json' -Body (ConvertTo-Json \$body)
+            """
           }
         }
       }
     }
+
     failure {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         script {
-          def msg = "❌ ${env.JOB_NAME} [${env.BRANCH_NAME}] build #${env.BUILD_NUMBER} failed"
+          def msg = "❌ ${env.JOB_NAME} [${env.BRANCH_NAME ?: 'local'}] build #${env.BUILD_NUMBER} failed"
+          env.NOTIFY_MSG = msg
           if (isUnix()) {
-            sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${SLACK_WEBHOOK} || true"
+            sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${env.SLACK_WEBHOOK} || true"
           } else {
-            bat "powershell -NoProfile -Command \"Invoke-RestMethod -Uri '${SLACK_WEBHOOK}' -Method Post -ContentType 'application/json' -Body (ConvertTo-Json @{text='${msg.replaceAll(\"'\",\"`'")} })\""
+            bat """
+              powershell -NoProfile -Command ^
+                \$body = @{ text = [System.Environment]::GetEnvironmentVariable('NOTIFY_MSG') }; ^
+                Invoke-RestMethod -Uri '${env.SLACK_WEBHOOK}' -Method Post -ContentType 'application/json' -Body (ConvertTo-Json \$body)
+            """
           }
         }
       }
     }
+
     cleanup {
       script {
         try {
@@ -152,7 +164,9 @@ pipeline {
           } else {
             bat 'cmd /c "set DOCKER_HOST=%DOCKER_HOST% && docker logout || echo logout-failed"'
           }
-        } catch (e) { echo "docker logout skipped: ${e}" }
+        } catch (e) {
+          echo "docker logout skipped: ${e}"
+        }
       }
     }
   }
