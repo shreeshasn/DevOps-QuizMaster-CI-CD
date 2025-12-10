@@ -2,9 +2,8 @@ pipeline {
   agent any
 
   environment {
-    // these are placeholders for readability; actual secret values come from withCredentials blocks
-    APP_NAME = "devops-quizmaster"
-    DOCKER_REPO = "shreeshasn/devops-quizmaster"
+    APP_NAME   = 'devops-quizmaster'
+    DOCKER_REPO = 'shreeshasn/devops-quizmaster'
   }
 
   stages {
@@ -14,27 +13,38 @@ pipeline {
       }
     }
 
-    stage('Set API key (.env.local)') {
+    stage('Create .env.local from Jenkins secret') {
       steps {
-        // quiz-api-key must be a Secret Text credential in Jenkins
+        // quiz-api-key: Secret text credential in Jenkins
         withCredentials([string(credentialsId: 'quiz-api-key', variable: 'QUIZ_API_KEY')]) {
           powershell '''
-            Write-Output "Creating .env.local with VITE_API_KEY from Jenkins credential..."
-            # Ensure file overwritten each run
-            Set-Content -Path .env.local -Value "VITE_API_KEY=$env:QUIZ_API_KEY" -Force
-            Write-Output ".env.local created."
+            Write-Output "Writing .env.local"
+            $value = "VITE_API_KEY=$env:QUIZ_API_KEY"
+            Set-Content -Path .env.local -Value $value -Force
+            Write-Output ".env.local contents:"
             Get-Content .env.local
           '''
         }
       }
     }
 
-    stage('Install') {
+    stage('Install dependencies') {
       steps {
         powershell '''
-          Write-Output "Node version:"
-          node -v || Write-Output "node not found"
-          Write-Output "Installing dependencies..."
+          Write-Output "Check node"
+          try {
+            $nv = & node -v 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Output "node not found or returned non-zero exit code: $nv"
+              exit 1
+            } else {
+              Write-Output "Node version: $nv"
+            }
+          } catch {
+            Write-Output "node command failed: $_"
+            exit 1
+          }
+          Write-Output "Running npm ci..."
           npm ci
         '''
       }
@@ -43,7 +53,7 @@ pipeline {
     stage('Build') {
       steps {
         powershell '''
-          Write-Output "Building production assets..."
+          Write-Output "Running build..."
           npm run build
         '''
       }
@@ -51,34 +61,27 @@ pipeline {
 
     stage('Docker Build & Push') {
       steps {
-        // dockerhub-creds must be a username/password credential in Jenkins
+        // dockerhub-creds: Username with password credential in Jenkins
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_PASS')]) {
           powershell '''
-            # compute image tag from current git short SHA
-            $tag = (git rev-parse --short HEAD).Trim()
+            Write-Output "Determining git tag..."
+            $tag = (git rev-parse --short HEAD 2>$null).Trim()
             if (-not $tag) { $tag = "local-latest" }
             $image = "$env:DOCKER_REPO:$tag"
-            Write-Output "Building docker image: $image"
+            Write-Output "Image will be: $image"
 
-            # Login to DockerHub
-            $securePass = $env:DOCKERHUB_PASS
-            # echo password into docker login --password-stdin
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($securePass + "`n")
-            $ms = New-Object System.IO.MemoryStream(,$bytes)
-            $ms.Position = 0
-            $stream = [System.Console]::OpenStandardInput()
-            # Use here-string approach with docker login --password-stdin
             Write-Output "Logging into Docker Hub..."
-            echo $securePass | docker login -u $env:DOCKERHUB_USER --password-stdin
+            # Use password via stdin (PowerShell piping works)
+            $env:DOCKERHUB_PASS | docker login -u $env:DOCKERHUB_USER --password-stdin
 
-            # Build & push
+            Write-Output "Building docker image..."
             docker build -t $image .
-            Write-Output "Pushing image $image"
+
+            Write-Output "Pushing docker image..."
             docker push $image
 
-            # persist tag to a file for optional deploy usage later
+            Write-Output "Saving tag to .image_tag"
             Set-Content -Path .image_tag -Value $tag -Force
-            Write-Output "Image pushed and .image_tag written ($tag)"
           '''
         }
       }
@@ -86,36 +89,40 @@ pipeline {
 
     stage('Optional: Deploy to Kubernetes') {
       when {
-        expression {
-          // Only try deploy if kubeconfig credential exists - change this flag if you always want it
-          return fileExists('k8s/deployment.yaml') && (env.KUBECONF_CRED_ID != null)
+        allOf {
+          expression { fileExists('k8s/deployment.yaml') }
+          expression { credentialsExists('kubeconfig') } // custom helper below
         }
       }
       steps {
-        // kubeconfig must be stored as a Secret file credential with id 'kubeconfig'
+        // kubeconfig: Secret file credential id 'kubeconfig'
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF')]) {
           powershell '''
-            # point kubectl to the provided kubeconfig file
+            # use provided kubeconfig file
             $env:KUBECONFIG = $env:KUBECONF
-            $tag = (Get-Content .image_tag -ErrorAction SilentlyContinue) -as [string]
-            if (-not $tag) { $tag = (git rev-parse --short HEAD).Trim() }
-            if (-not $tag) { Write-Error "Cannot determine image tag, aborting deploy"; exit 1 }
-            $image = "$env:DOCKER_REPO:$tag"
-            Write-Output "Deploying image $image to Kubernetes (kubeconfig provided)."
 
-            # If deployment exists, update image; otherwise apply manifest after replacing placeholder
+            $tag = ""
+            if (Test-Path .image_tag) { $tag = (Get-Content .image_tag).Trim() }
+            if (-not $tag) { $tag = (git rev-parse --short HEAD 2>$null).Trim() }
+            if (-not $tag) { Write-Error "Cannot determine image tag"; exit 1 }
+
+            $image = "$env:DOCKER_REPO:$tag"
+            Write-Output "Deploying image: $image"
+
+            # if deployment exists, update image; otherwise replace placeholder and apply
             $exists = (kubectl get deployment $env:APP_NAME-deployment -o name 2>$null).Trim()
             if ($exists) {
-              Write-Output "Updating existing deployment image..."
+              Write-Output "Deployment exists - updating image"
               kubectl set image deployment/$env:APP_NAME-deployment app=$image --record
             } else {
-              Write-Output "Applying new manifest with image replacement..."
-              (Get-Content k8s/deployment.yaml) -replace "__IMAGE_PLACEHOLDER__", $image | kubectl apply -f -
+              Write-Output "Creating deployment from manifest (replacing placeholder)"
+              $manifest = Get-Content k8s/deployment.yaml -Raw
+              $manifest = $manifest -replace '__IMAGE_PLACEHOLDER__', $image
+              $manifest | kubectl apply -f -
             }
 
-            # roll-out status
+            Write-Output "Waiting for rollout..."
             kubectl rollout status deployment/$env:APP_NAME-deployment
-            Write-Output "Deploy step finished."
           '''
         }
       }
@@ -126,30 +133,55 @@ pipeline {
     success {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
-          $body = @{ text = "Pipeline SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}" } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
-          Write-Output "Slack notified of success."
+          try {
+            $payload = @{ text = "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}" } | ConvertTo-Json
+            Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
+            Write-Output "Slack notified of success."
+          } catch {
+            Write-Output "Slack notify failed: $_"
+          }
         '''
       }
     }
+
     failure {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
-          $body = @{ text = "Pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}" } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
-          Write-Output "Slack notified of failure."
+          try {
+            $payload = @{ text = "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER}" } | ConvertTo-Json
+            Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
+            Write-Output "Slack notified of failure."
+          } catch {
+            Write-Output "Slack notify failed: $_"
+          }
         '''
       }
     }
+
     always {
       powershell '''
-        Write-Output "Cleaning up docker login (logout) if present..."
+        Write-Output "Attempting docker logout (safe)..."
         try {
           docker logout
         } catch {
-          Write-Output "docker logout failed or not logged in"
+          Write-Output "docker logout failed or was not logged in"
         }
       '''
     }
+  }
+}
+
+// Utility function used in when{} (Groovy side). This avoids failing pipeline if kubeconfig missing.
+def credentialsExists(String id) {
+  try {
+    return com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+      com.cloudbees.plugins.credentials.common.StandardCredentials.class,
+      Jenkins.instance,
+      null,
+      null
+    ).any { it.id == id }
+  } catch (e) {
+    // if lookup fails, prefer false to avoid breaking pipeline parse
+    return false
   }
 }
