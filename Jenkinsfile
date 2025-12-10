@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   environment {
-    IMAGE_BASE = "shreesha/devops-quizmaster" // <-- set this
+    IMAGE_BASE = "shreeshasn/devops-quizmaster" // <-- set this
   }
 
   options {
