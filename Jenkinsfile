@@ -2,23 +2,37 @@ pipeline {
   agent any
 
   environment {
-    APP_NAME    = 'devops-quizmaster'
-    DOCKER_REPO = 'shreeshasn/devops-quizmaster' // change if needed
+    // Image name base
+    IMAGE_REPO = "shreeshasn/devops-quizmaster"
+    // tag will be set dynamically from git short commit
   }
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Prepare') {
+      steps {
+        powershell '''
+          # Get short commit hash for tagging
+          $sha = (git rev-parse --short HEAD).Trim()
+          Write-Output "IMAGE_TAG = $sha"
+          echo "##vso[task.setvariable variable=IMAGE_TAG]$sha"
+        '''
+      }
     }
 
     stage('Write .env.local (API key)') {
       steps {
         withCredentials([string(credentialsId: 'quiz-api-key', variable: 'QUIZ_API_KEY')]) {
           powershell '''
-            Write-Output "Creating .env.local"
-            $line = "VITE_API_KEY=$env:QUIZ_API_KEY"
-            Set-Content -Path .env.local -Value $line -Force
-            Get-Content .env.local
+            # create .env.local with the Vite key expected by your app
+            $content = "VITE_API_KEY=$env:QUIZ_API_KEY"
+            Set-Content -Path .env.local -Value $content -Force -Encoding UTF8
+            Write-Output "Created .env.local"
           '''
         }
       }
@@ -27,13 +41,9 @@ pipeline {
     stage('Install') {
       steps {
         powershell '''
-          Write-Output "Node check..."
-          try {
-            $v = node -v 2>$null
-            if ($LASTEXITCODE -ne 0) { throw "node not found" }
-            Write-Output "Node version: $v"
-          } catch { Write-Error $_; exit 1 }
-          Write-Output "npm ci"
+          Write-Output "Node version:"
+          node -v
+          Write-Output "Running npm ci"
           npm ci
         '''
       }
@@ -42,51 +52,54 @@ pipeline {
     stage('Build') {
       steps {
         powershell '''
-          Write-Output "Running build..."
+          Write-Output "Building production assets"
           npm run build
         '''
       }
     }
 
-    stage('Build Docker image (local)') {
+    stage('Docker Build (local)') {
       steps {
-        powershell '''
-          $tag = (git rev-parse --short HEAD 2>$null).Trim()
-          if (-not $tag) { $tag = "local-latest" }
-          $image = "${env:DOCKER_REPO}:$tag"
-          Write-Output "Building local image: $image"
-          docker build -t $image .
-          Set-Content -Path .image_tag -Value $tag -Force
-          Write-Output "Built: $image"
-        '''
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+          powershell '''
+            $sha = "${env:IMAGE_TAG}"
+            if (-not $sha) { $sha = (git rev-parse --short HEAD).Trim() }
+            $imageTag = "${env:IMAGE_REPO}:$sha"
+            Write-Output "Building local image: $imageTag"
+
+            # Optional: set DOCKER_HOST if you use TCP daemon on 127.0.0.1:2375
+            # $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
+
+            docker build -t $imageTag .
+            Write-Output "Built: $imageTag"
+
+            # Save tag for later stages
+            Set-Content -Path .image_tag -Value $imageTag -Force
+          '''
+        }
       }
     }
 
-    stage('Push Image (try)') {
+    stage('Docker Push') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
           powershell '''
-            $tag = Get-Content .image_tag -ErrorAction SilentlyContinue
-            if (-not $tag) { $tag = (git rev-parse --short HEAD 2>$null).Trim() }
-            $image = "${env:DOCKER_REPO}:$tag"
-            Write-Output "Attempting docker login..."
-            $pw = $env:DOCKERHUB_PASS
-            try {
-              $pw | docker login -u $env:DOCKERHUB_USER --password-stdin
-              Write-Output "Docker login succeeded."
-            } catch {
-              Write-Warning "Docker login failed: $_"
-              Write-Warning "Skipping push, proceeding with local image."
-              exit 0
-            }
-            # If docker daemon not exposed via TCP, we still can push if docker engine available locally
-            try {
-              docker push $image
-              Write-Output "Pushed $image"
-            } catch {
-              Write-Warning "Docker push failed: $_"
-              Write-Warning "Proceeding with local image for local Kubernetes (no push)."
-            }
+            $imageTag = Get-Content -Path .image_tag
+            if (-not $imageTag) { throw "image tag file missing" }
+
+            Write-Output "Logging into Docker Hub"
+            $pw = $env:DOCKER_PASS
+            $user = $env:DOCKER_USER
+
+            # Use docker login with stdin to avoid exposing password in logs
+            $pw | docker login --username $user --password-stdin
+            if ($LASTEXITCODE -ne 0) { throw "docker login failed" }
+
+            Write-Output "Pushing $imageTag"
+            docker push $imageTag
+            if ($LASTEXITCODE -ne 0) { throw "docker push failed" }
+
+            Write-Output "Docker push finished"
           '''
         }
       }
@@ -97,77 +110,63 @@ pipeline {
         expression { fileExists('k8s/deployment.yaml') }
       }
       steps {
-        // if you have a kubeconfig credential, use it; otherwise assume kubectl on agent already points to Docker Desktop
-        script {
-          def useKubeCred = false
-          try {
-            useKubeCred = com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
-              com.cloudbees.plugins.credentials.common.StandardCredentials.class, Jenkins.instance, null, null
-            ).any { it.id == 'kubeconfig' }
-          } catch(e) { useKubeCred = false }
-          if (useKubeCred) {
-            withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF')]) {
-              powershell '''
-                $env:KUBECONFIG = $env:KUBECONF
-                $tag = Get-Content .image_tag
-                $image = "${env:DOCKER_REPO}:$tag"
-                $exists = (kubectl get deployment ${env:APP_NAME}-deployment -o name 2>$null).Trim()
-                if ($exists) {
-                  kubectl set image deployment/${env:APP_NAME}-deployment app=$image --record
-                } else {
-                  $manifest = Get-Content k8s/deployment.yaml -Raw
-                  $manifest = $manifest -replace '__IMAGE_PLACEHOLDER__', $image
-                  $manifest | kubectl apply -f -
-                }
-                kubectl rollout status deployment/${env:APP_NAME}-deployment
-              '''
+        // kubeconfig stored as "File" credential with id 'kubeconfig'
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONF_PATH')]) {
+          powershell '''
+            $imageTag = Get-Content -Path .image_tag
+            if (-not $imageTag) { throw "image tag file missing" }
+
+            Write-Output "Using kubeconfig file at: $env:KUBECONF_PATH"
+            $env:KUBECONFIG = $env:KUBECONF_PATH
+
+            # If deployment exists, set image; otherwise apply manifest with placeholder replacement
+            $dep = kubectl get deployment devops-quizmaster-deployment -o name 2>$null
+            if ($dep) {
+              Write-Output "Deployment exists — updating image"
+              kubectl set image deployment/devops-quizmaster-deployment app=$imageTag --record
+            } else {
+              Write-Output "Applying k8s manifest with image replacement"
+              (Get-Content k8s/deployment.yaml) -replace '__IMAGE_PLACEHOLDER__', $imageTag | kubectl apply -f -
             }
-          } else {
-            powershell '''
-              Write-Output "No kubeconfig credential; assuming kubectl already points to desired local cluster."
-              $tag = Get-Content .image_tag
-              $image = "${env:DOCKER_REPO}:$tag"
-              $exists = (kubectl get deployment ${env:APP_NAME}-deployment -o name 2>$null).Trim()
-              if ($exists) {
-                kubectl set image deployment/${env:APP_NAME}-deployment app=$image --record
-              } else {
-                $manifest = Get-Content k8s/deployment.yaml -Raw
-                $manifest = $manifest -replace '__IMAGE_PLACEHOLDER__', $image
-                $manifest | kubectl apply -f -
-              }
-              kubectl rollout status deployment/${env:APP_NAME}-deployment
-            '''
-          }
+
+            # Optional: show rollout status
+            kubectl rollout status deployment/devops-quizmaster-deployment
+            kubectl get pods -l app=devops-quizmaster -o wide
+            kubectl get svc devops-quizmaster-svc -o wide
+          '''
         }
       }
     }
   }
 
   post {
-    always {
-      powershell '''
-        try { docker logout } catch { Write-Output "docker logout safe: ignored" }
-      '''
-    }
     success {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
-          try {
-            $payload = @{ text = "SUCCESS: ${env:JOB_NAME} #${env:BUILD_NUMBER}" } | ConvertTo-Json
-            Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
-          } catch { Write-Output "Slack notify failed: $_" }
+          $body = @{ text = "Build & deploy succeeded: ${env.BUILD_URL}" } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
+          Write-Output "Slack notified"
         '''
       }
     }
     failure {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
-          try {
-            $payload = @{ text = "FAILURE: ${env:JOB_NAME} #${env:BUILD_NUMBER}" } | ConvertTo-Json
-            Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
-          } catch { Write-Output "Slack notify failed: $_" }
+          $body = @{ text = "Build failed: ${env.BUILD_URL}" } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
+          Write-Output "Slack notified of failure"
         '''
       }
+    }
+    always {
+      // best-effort docker logout
+      powershell '''
+        try {
+          docker logout
+        } catch {
+          Write-Output "docker logout failed or not logged in"
+        }
+      '''
     }
   }
 }
