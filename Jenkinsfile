@@ -2,7 +2,8 @@ pipeline {
   agent any
 
   environment {
-    IMAGE_BASE = "shreeshasn/devops-quizmaster" // <-- set this
+    IMAGE_BASE = "shreeshasn/devops-quizmaster"    // <--- change if your DockerHub repo is different
+    DOCKER_HOST = "tcp://127.0.0.1:2375"        // forces docker CLI to use TCP on Windows
   }
 
   options {
@@ -15,7 +16,6 @@ pipeline {
       steps {
         checkout scm
         script {
-          // write short sha to file in a cross-platform way
           if (isUnix()) {
             sh 'git rev-parse --short HEAD > .gitsha'
           } else {
@@ -55,13 +55,14 @@ pipeline {
       steps {
         script {
           def sha = readFile('.gitsha').trim()
-          def safeBranch = env.BRANCH_NAME.replaceAll('/', '-')
+          def safeBranch = env.BRANCH_NAME ? env.BRANCH_NAME.replaceAll('/', '-') : 'local'
           env.IMAGE_TAG = "${IMAGE_BASE}:${safeBranch}-${sha}"
 
           if (isUnix()) {
             sh "docker build -t ${env.IMAGE_TAG} ."
           } else {
-            bat "docker build -t ${env.IMAGE_TAG} ."
+            // ensure docker uses TCP socket on Windows
+            bat "set DOCKER_HOST=${DOCKER_HOST} && docker build -t ${env.IMAGE_TAG} ."
           }
         }
       }
@@ -75,16 +76,15 @@ pipeline {
               sh 'echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USER" --password-stdin'
               sh "docker push ${env.IMAGE_TAG}"
             } else {
-              // Windows CMD: pipe password into docker login
-              bat "cmd /c \"echo %DOCKERHUB_PASS% | docker login -u %DOCKERHUB_USER% --password-stdin\""
-              bat "docker push ${env.IMAGE_TAG}"
+              bat "set DOCKER_HOST=${DOCKER_HOST} && echo %DOCKERHUB_PASS% | docker login -u %DOCKERHUB_USER% --password-stdin"
+              bat "set DOCKER_HOST=${DOCKER_HOST} && docker push ${env.IMAGE_TAG}"
             }
           }
         }
       }
     }
 
-    stage('Deploy to K8s (optional)') {
+    stage('Optional: Deploy to K8s') {
       when {
         expression { return fileExists('k8s/deployment.yaml') && env.KUBE_DEPLOY == 'true' }
       }
@@ -101,9 +101,8 @@ pipeline {
                 fi
               '''
             } else {
-              // Use PowerShell style on Windows
               bat '''
-                powershell -Command ^
+                powershell -NoProfile -Command ^
                   $env:KUBECONFIG="$env:KUBECONF"; ^
                   if (kubectl get deployment devops-quizmaster-deployment -o name) { ^
                     kubectl set image deployment/devops-quizmaster-deployment app=%IMAGE_TAG% --record ^
@@ -122,51 +121,53 @@ pipeline {
     success {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         script {
-          // Use Groovy HTTP to post to Slack (avoids shell)
-          def text = "✅ ${env.JOB_NAME} [${env.BRANCH_NAME}] build #${env.BUILD_NUMBER} succeeded — ${env.IMAGE_TAG}"
-          sendSlack(env.SLACK_WEBHOOK, text)
+          def msg = "✅ ${env.JOB_NAME} [${env.BRANCH_NAME ?: 'local'}] build #${env.BUILD_NUMBER} succeeded — ${env.IMAGE_TAG}"
+          env.NOTIFY_MSG = msg
+          if (isUnix()) {
+            // escape double quotes in message
+            sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${env.SLACK_WEBHOOK} || true"
+          } else {
+            // read message from environment in PowerShell to avoid complex quoting
+            bat """
+              powershell -NoProfile -Command ^
+                \$body = @{ text = [System.Environment]::GetEnvironmentVariable('NOTIFY_MSG') }; ^
+                Invoke-RestMethod -Uri '${env.SLACK_WEBHOOK}' -Method Post -ContentType 'application/json' -Body (ConvertTo-Json \$body)
+            """
+          }
         }
       }
     }
+
     failure {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         script {
-          def text = "❌ ${env.JOB_NAME} [${env.BRANCH_NAME}] build #${env.BUILD_NUMBER} failed"
-          sendSlack(env.SLACK_WEBHOOK, text)
+          def msg = "❌ ${env.JOB_NAME} [${env.BRANCH_NAME ?: 'local'}] build #${env.BUILD_NUMBER} failed"
+          env.NOTIFY_MSG = msg
+          if (isUnix()) {
+            sh "curl -s -X POST -H 'Content-Type: application/json' --data '{\"text\":\"${msg.replaceAll('\"','\\\\\"')}\"}' ${env.SLACK_WEBHOOK} || true"
+          } else {
+            bat """
+              powershell -NoProfile -Command ^
+                \$body = @{ text = [System.Environment]::GetEnvironmentVariable('NOTIFY_MSG') }; ^
+                Invoke-RestMethod -Uri '${env.SLACK_WEBHOOK}' -Method Post -ContentType 'application/json' -Body (ConvertTo-Json \$body)
+            """
+          }
         }
       }
     }
+
     cleanup {
       script {
         try {
           if (isUnix()) {
             sh 'docker logout || true'
           } else {
-            bat 'cmd /c "docker logout || echo logout-failed"'
+            bat 'cmd /c "set DOCKER_HOST=%DOCKER_HOST% && docker logout || echo logout-failed"'
           }
-        } catch (e) { echo "docker logout skipped: ${e}" }
+        } catch (e) {
+          echo "docker logout skipped: ${e}"
+        }
       }
     }
-  } // post
-
-} // pipeline
-
-// helper function to post to slack using pure JVM (no external curl)
-def sendSlack(String webhookUrl, String message) {
-  try {
-    def payload = "{\"text\":\"${message.replaceAll('"','\\\"')}\"}"
-    def url = new URL(webhookUrl)
-    def conn = url.openConnection()
-    conn.setRequestMethod("POST")
-    conn.setDoOutput(true)
-    conn.setRequestProperty("Content-Type", "application/json")
-    def os = conn.getOutputStream()
-    os.write(payload.getBytes("UTF-8"))
-    os.flush()
-    os.close()
-    def respCode = conn.getResponseCode()
-    echo "Slack post response code: ${respCode}"
-  } catch (err) {
-    echo "Failed to send slack message: ${err}"
   }
 }
