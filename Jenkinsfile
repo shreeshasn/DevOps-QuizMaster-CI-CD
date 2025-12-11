@@ -1,9 +1,15 @@
 pipeline {
   agent any
 
+  /* parameters ensure params.PUSH_TO_DOCKERHUB / params.DEPLOY_TO_K8S always exist */
+  parameters {
+    booleanParam(name: 'PUSH_TO_DOCKERHUB', defaultValue: false, description: 'Push built image to Docker Hub')
+    booleanParam(name: 'DEPLOY_TO_K8S', defaultValue: false, description: 'Deploy to Kubernetes after push/build')
+  }
+
   environment {
     IMAGE_REPO = "shreeshasn/devops-quizmaster"
-    IMAGE_TAG  = ""   // populated in Prepare stage
+    IMAGE_TAG  = ""
   }
 
   stages {
@@ -11,8 +17,11 @@ pipeline {
       steps {
         powershell '''
           Write-Output "Setting IMAGE_TAG from git"
-          $sha = (git rev-parse --short HEAD).Trim()
+          $sha = (git rev-parse --short HEAD) -replace "\\r|\\n",""
           if (-not $sha) { $sha = "local" }
+          Write-Output "Computed SHA: $sha"
+          # export for later steps
+          setx IMAGE_TAG $sha > $null
           $env:IMAGE_TAG = $sha
           Write-Output "IMAGE_TAG = $env:IMAGE_TAG"
         '''
@@ -35,11 +44,11 @@ pipeline {
         powershell '''
           Write-Output "Node version: $(node -v)"
           Write-Output "NPM version: $(npm -v)"
-          Write-Output "Installing dependencies (npm ci)"
+          Write-Output "Running npm ci"
           npm ci
           if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
 
-          Write-Output "Building production assets (npm run build)"
+          Write-Output "Running npm run build"
           npm run build
           if ($LASTEXITCODE -ne 0) { throw "npm build failed" }
         '''
@@ -49,17 +58,18 @@ pipeline {
     stage('Docker: build (local)') {
       steps {
         powershell '''
-          $tag = "$env:IMAGE_REPO:$env:IMAGE_TAG"
+          $tag = "${env:IMAGE_REPO}:${env:IMAGE_TAG}"
           Write-Output "Building image: $tag"
           docker build -t $tag .
           if ($LASTEXITCODE -ne 0) { throw "docker build failed" }
+          Write-Output "Built: $tag"
         '''
       }
     }
 
     stage('Docker: push (optional)') {
       when {
-        expression { return (params.PUSH_TO_DOCKERHUB ? true : false) }
+        expression { return params.PUSH_TO_DOCKERHUB == true }
       }
       steps {
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_PASS')]) {
@@ -70,7 +80,7 @@ pipeline {
             $pass | docker login --username $user --password-stdin
             if ($LASTEXITCODE -ne 0) { throw "docker login failed" }
 
-            $tag = "$env:IMAGE_REPO:$env:IMAGE_TAG"
+            $tag = "${env:IMAGE_REPO}:${env:IMAGE_TAG}"
             Write-Output "Pushing $tag"
             docker push $tag
             if ($LASTEXITCODE -ne 0) { throw "docker push failed" }
@@ -81,7 +91,10 @@ pipeline {
 
     stage('Optional: Deploy to Kubernetes') {
       when {
-        expression { return (fileExists('k8s') -or params.DEPLOY_TO_K8S) }
+        anyOf {
+          expression { return params.DEPLOY_TO_K8S == true }
+          expression { return fileExists('k8s') } 
+        }
       }
       steps {
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
@@ -89,23 +102,26 @@ pipeline {
             Write-Output "Using kubeconfig at $env:KUBECONFIG_FILE"
             $env:KUBECONFIG = $env:KUBECONFIG_FILE
 
-            # apply manifests if you have them under k8s/
-            if (Test-Path k8s) {
+            if (Test-Path "k8s") {
+              Write-Output "Applying manifests from k8s/"
               kubectl apply -f k8s
               if ($LASTEXITCODE -ne 0) { throw "kubectl apply failed" }
+            } else {
+              Write-Output "No k8s/ folder found; skipping manifest apply"
             }
 
-            # ensure service is NodePort on port 30080 (adjust names if needed)
+            # Attempt to ensure service nodePort 30080 (adjust service name if different)
             $svc = "devops-quizmaster-svc"
-            if ((kubectl get svc $svc -o name) -ne $null) {
-              Write-Output "Patching service $svc to nodePort 30080 (if not already)"
+            $exists = (kubectl get svc $svc -o name) 2>$null
+            if ($exists) {
+              Write-Output "Patching service $svc to NodePort 30080"
               kubectl patch svc $svc -p '{"spec":{"type":"NodePort"}}' --type=merge
               kubectl patch svc $svc -p '{"spec":{"ports":[{"port":80,"nodePort":30080,"protocol":"TCP"}]}}' --type=merge
             } else {
-              Write-Output "Service $svc not found. Create one or check k8s manifests."
+              Write-Output "Service $svc not present - check your manifests or create service"
             }
 
-            Write-Output "Deployment/Service applied. Use kubectl get pods,svc to check."
+            Write-Output "Kubernetes deploy step finished"
           '''
         }
       }
@@ -116,10 +132,9 @@ pipeline {
     success {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
-          $msg = @{ text = "Build SUCCESS: $env:JOB_NAME #$env:BUILD_NUMBER - $env:IMAGE_REPO:$env:IMAGE_TAG" } | ConvertTo-Json
+          $msg = @{ text = "Build SUCCESS: $env:JOB_NAME #$env:BUILD_NUMBER - ${env:IMAGE_REPO}:${env:IMAGE_TAG}" } | ConvertTo-Json
           $web = $env:SLACK_WEBHOOK
-          $response = Invoke-RestMethod -Uri $web -Method Post -Body $msg -ContentType "application/json"
-          Write-Output "Slack notified success"
+          try { Invoke-RestMethod -Uri $web -Method Post -Body $msg -ContentType "application/json" ; Write-Output "Slack notified success" } catch { Write-Output "Slack notify failed: $_" }
         '''
       }
     }
@@ -128,18 +143,14 @@ pipeline {
         powershell '''
           $msg = @{ text = "Build FAILED: $env:JOB_NAME #$env:BUILD_NUMBER" } | ConvertTo-Json
           $web = $env:SLACK_WEBHOOK
-          try { Invoke-RestMethod -Uri $web -Method Post -Body $msg -ContentType "application/json" } catch { Write-Output "Slack notify failed: $_" }
+          try { Invoke-RestMethod -Uri $web -Method Post -Body $msg -ContentType "application/json" ; Write-Output "Slack notified failure" } catch { Write-Output "Slack notify failed: $_" }
         '''
       }
     }
     always {
       powershell '''
-        Write-Output "Post: attempt docker logout (safe)"
-        try {
-          docker logout 2>$null
-        } catch {
-          Write-Output "docker logout failed or not logged in"
-        }
+        Write-Output "Attempt docker logout (safe)"
+        try { docker logout } catch { Write-Output "docker logout not needed or failed" }
       '''
     }
   }
