@@ -1,30 +1,26 @@
 pipeline {
   agent any
 
-  /* parameters ensure params.PUSH_TO_DOCKERHUB / params.DEPLOY_TO_K8S always exist */
   parameters {
     booleanParam(name: 'PUSH_TO_DOCKERHUB', defaultValue: false, description: 'Push built image to Docker Hub')
-    booleanParam(name: 'DEPLOY_TO_K8S', defaultValue: false, description: 'Deploy to Kubernetes after push/build')
+    booleanParam(name: 'DEPLOY_TO_K8S', defaultValue: false, description: 'Deploy to Kubernetes after build')
   }
 
   environment {
     IMAGE_REPO = "shreeshasn/devops-quizmaster"
-    IMAGE_TAG  = ""
+    IMAGE_TAG  = ""   // will be set in Prepare stage
   }
 
   stages {
     stage('Prepare') {
       steps {
-        powershell '''
-          Write-Output "Setting IMAGE_TAG from git"
-          $sha = (git rev-parse --short HEAD) -replace "\\r|\\n",""
-          if (-not $sha) { $sha = "local" }
-          Write-Output "Computed SHA: $sha"
-          # export for later steps
-          setx IMAGE_TAG $sha > $null
-          $env:IMAGE_TAG = $sha
-          Write-Output "IMAGE_TAG = $env:IMAGE_TAG"
-        '''
+        script {
+          // run powershell and capture stdout; trim newlines
+          def sha = powershell(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+          if (!sha) { sha = "local" }
+          env.IMAGE_TAG = sha
+          echo "Using IMAGE_TAG = ${env.IMAGE_TAG}"
+        }
       }
     }
 
@@ -32,8 +28,8 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: 'quiz-api-key', variable: 'QUIZ_API_KEY')]) {
           powershell '''
-            Write-Output ".env.local created"
             "VITE_API_KEY=$env:QUIZ_API_KEY" | Out-File -FilePath .env.local -Encoding ascii
+            Write-Output ".env.local created"
           '''
         }
       }
@@ -93,13 +89,13 @@ pipeline {
       when {
         anyOf {
           expression { return params.DEPLOY_TO_K8S == true }
-          expression { return fileExists('k8s') } 
+          expression { return fileExists('k8s') }
         }
       }
       steps {
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
           powershell '''
-            Write-Output "Using kubeconfig at $env:KUBECONFIG_FILE"
+            Write-Output "Using kubeconfig file: $env:KUBECONFIG_FILE"
             $env:KUBECONFIG = $env:KUBECONFIG_FILE
 
             if (Test-Path "k8s") {
@@ -107,21 +103,21 @@ pipeline {
               kubectl apply -f k8s
               if ($LASTEXITCODE -ne 0) { throw "kubectl apply failed" }
             } else {
-              Write-Output "No k8s/ folder found; skipping manifest apply"
+              Write-Output "No k8s/ folder found; skipping manifests"
             }
 
-            # Attempt to ensure service nodePort 30080 (adjust service name if different)
+            # Try to set NodePort 30080 for expected service name (adjust if your svc name differs)
             $svc = "devops-quizmaster-svc"
-            $exists = (kubectl get svc $svc -o name) 2>$null
-            if ($exists) {
-              Write-Output "Patching service $svc to NodePort 30080"
+            $svcExists = & kubectl get svc $svc -o name 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Output "Patching service $svc to NodePort 30080 (if needed)"
               kubectl patch svc $svc -p '{"spec":{"type":"NodePort"}}' --type=merge
               kubectl patch svc $svc -p '{"spec":{"ports":[{"port":80,"nodePort":30080,"protocol":"TCP"}]}}' --type=merge
             } else {
-              Write-Output "Service $svc not present - check your manifests or create service"
+              Write-Output "Service $svc not present - skip service patch"
             }
 
-            Write-Output "Kubernetes deploy step finished"
+            Write-Output "Kubernetes deploy finished"
           '''
         }
       }
@@ -133,20 +129,20 @@ pipeline {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
           $msg = @{ text = "Build SUCCESS: $env:JOB_NAME #$env:BUILD_NUMBER - ${env:IMAGE_REPO}:${env:IMAGE_TAG}" } | ConvertTo-Json
-          $web = $env:SLACK_WEBHOOK
-          try { Invoke-RestMethod -Uri $web -Method Post -Body $msg -ContentType "application/json" ; Write-Output "Slack notified success" } catch { Write-Output "Slack notify failed: $_" }
+          try { Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -Body $msg -ContentType "application/json"; Write-Output "Slack notified success" } catch { Write-Output "Slack notify failed: $_" }
         '''
       }
     }
+
     failure {
       withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
         powershell '''
           $msg = @{ text = "Build FAILED: $env:JOB_NAME #$env:BUILD_NUMBER" } | ConvertTo-Json
-          $web = $env:SLACK_WEBHOOK
-          try { Invoke-RestMethod -Uri $web -Method Post -Body $msg -ContentType "application/json" ; Write-Output "Slack notified failure" } catch { Write-Output "Slack notify failed: $_" }
+          try { Invoke-RestMethod -Uri $env:SLACK_WEBHOOK -Method Post -Body $msg -ContentType "application/json"; Write-Output "Slack notified failure" } catch { Write-Output "Slack notify failed: $_" }
         '''
       }
     }
+
     always {
       powershell '''
         Write-Output "Attempt docker logout (safe)"
